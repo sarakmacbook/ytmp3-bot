@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""YouTube MP3 Telegram Bot v6 — progress bar, cancel, thumbnail, queue, status, better errors."""
+"""YouTube MP3 Telegram Bot v6.1 — progress bar, cancel, thumbnail, queue, status, better errors."""
 
-import os, sys, re, asyncio, logging, tempfile, traceback, base64, io, time
+import os, sys, re, asyncio, logging, tempfile, traceback, base64, io, time, signal
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from datetime import timedelta
@@ -13,18 +13,19 @@ from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-BOT_TOKEN=os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 AUDIO_QUALITY = "192"
 MAX_DURATION = 3600
 COOKIE_FILE = os.environ.get("COOKIE_FILE", "/opt/ytmp3-bot/cookies.txt")
-BOT_VERSION = "v6"
+BOT_VERSION = "v6.1"
 BOT_START_TIME = time.time()
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ─── Track active downloads per user ───────────────────────
-active_downloads = {}  # user_id -> asyncio.subprocess.Process
+# user_id -> {"proc": asyncio.subprocess.Process, "cancel_event": asyncio.Event, "status_msg_id": int}
+active_downloads = {}
 
 # ─── Download queue per user ───────────────────────────────
 download_queues = {}   # user_id -> list of URLs waiting
@@ -204,8 +205,8 @@ def human_error(err_text):
 async def async_download_and_convert(url, out_dir, user_id, status_msg, context):
     """
     Async download with live progress updates.
+    Uses asyncio.Event for instant cancel signaling.
     Returns (mp3_path, error_string).
-    Cancels cleanly if user presses cancel.
     """
     url = clean_url(url)
     log.info(f"Clean URL: {url}")
@@ -214,6 +215,7 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
         try: f.unlink()
         except: pass
 
+    cancel_event = active_downloads[user_id]["cancel_event"]
     cmd = build_ydl_cmd(url, out_dir)
     log.info(f"Starting async yt-dlp: {' '.join(cmd[:5])}...")
 
@@ -223,58 +225,94 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        active_downloads[user_id] = proc
+        active_downloads[user_id]["proc"] = proc
 
         last_update = asyncio.get_event_loop().time()
         progress_text = "⏳ Starting download..."
 
-        while True:
+        # Create a task for reading stderr
+        async def read_progress():
+            nonlocal progress_text, last_update
+            while True:
+                # Check cancel before each read
+                if cancel_event.is_set():
+                    return
+                try:
+                    line_bytes = await asyncio.wait_for(proc.stderr.readline(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        return
+                    if cancel_event.is_set():
+                        return
+                    continue
+
+                if not line_bytes:
+                    if proc.returncode is not None:
+                        return
+                    continue
+
+                if cancel_event.is_set():
+                    return
+
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                parsed = parse_ydl_progress(line)
+
+                if parsed:
+                    pct, speed, eta = parsed
+                    progress_text = make_progress_bar(pct, speed or 0, eta or 0)
+                    now = asyncio.get_event_loop().time()
+                    if now - last_update >= 2.0:
+                        last_update = now
+                        try:
+                            if not cancel_event.is_set():
+                                keyboard = InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+                                ])
+                                await status_msg.edit_text(progress_text, reply_markup=keyboard)
+                        except Exception:
+                            pass
+
+        # Run progress reader and wait for process concurrently
+        progress_task = asyncio.create_task(read_progress())
+
+        # Wait for process to finish OR cancel event
+        async def wait_for_cancel():
+            await cancel_event.wait()
+            # Cancel was triggered — kill process
             try:
-                line_bytes = await asyncio.wait_for(proc.stderr.readline(), timeout=1.0)
-            except asyncio.TimeoutError:
-                if proc.returncode is not None:
-                    break
-                if user_id not in active_downloads:
-                    return None, "Cancelled"
-                continue
-
-            if not line_bytes:
-                if proc.returncode is not None:
-                    break
-                continue
-
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            parsed = parse_ydl_progress(line)
-
-            if parsed:
-                pct, speed, eta = parsed
-                progress_text = make_progress_bar(pct, speed or 0, eta or 0)
-                now = asyncio.get_event_loop().time()
-                if now - last_update >= 2.0:
-                    last_update = now
-                    try:
-                        keyboard = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-                        ])
-                        await status_msg.edit_text(progress_text, reply_markup=keyboard)
-                    except Exception:
-                        pass
-
-            if user_id not in active_downloads:
                 proc.kill()
-                await proc.wait()
-                return None, "Cancelled"
+            except Exception:
+                pass
 
-        await proc.wait()
+        cancel_task = asyncio.create_task(wait_for_cancel())
 
-        if user_id not in active_downloads:
+        done, pending = await asyncio.wait(
+            {progress_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # If cancel task finished first, wait for process to die
+        if cancel_event.is_set():
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             return None, "Cancelled"
 
+        # Process finished normally
+        await proc.wait()
+
         if proc.returncode != 0:
-            stderr_out = await proc.stderr.read()
-            err_text = stderr_out.decode("utf-8", errors="replace")[:500]
-            log.error(f"yt-dlp failed (exit {proc.returncode}): {err_text}")
-            return None, err_text
+            stderr_out = ""
+            try:
+                stderr_out = (await proc.stderr.read()).decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            log.error(f"yt-dlp failed (exit {proc.returncode}): {stderr_out}")
+            return None, stderr_out
 
         found = []
         for ext in ("m4a", "mp4", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
@@ -290,6 +328,7 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
         except Exception:
             pass
 
+        # FFmpeg conversion with cancel support
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", str(src), "-vn", "-ar", "44100", "-ac", "2",
             "-b:a", f"{AUDIO_QUALITY}k", "-metadata", "encoder=YTMP3Bot", str(mp3)
@@ -299,10 +338,30 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        await ff_proc.wait()
+
+        # Wait for ffmpeg or cancel
+        ff_cancel = asyncio.create_task(cancel_event.wait())
+        ff_wait = asyncio.create_task(ff_proc.wait())
+
+        done2, _ = await asyncio.wait(
+            {ff_wait, ff_cancel},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if cancel_event.is_set():
+            try:
+                ff_proc.kill()
+                await asyncio.wait_for(ff_proc.wait(), timeout=3)
+            except Exception:
+                pass
+            return None, "Cancelled"
 
         if ff_proc.returncode != 0:
-            err = (await ff_proc.stderr.read()).decode("utf-8", errors="replace")[:200]
+            err = ""
+            try:
+                err = (await ff_proc.stderr.read()).decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
             return None, f"FFmpeg failed: {err}"
 
         if src != mp3 and src.exists():
@@ -310,8 +369,6 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
 
         return mp3, None
 
-    except asyncio.CancelledError:
-        return None, "Cancelled"
     except Exception as e:
         log.error(f"Download error: {e}\n{traceback.format_exc()}")
         return None, str(e)[:300]
@@ -415,8 +472,10 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if active_downloads:
         status_text += "\n🔄 Active:\n"
-        for uid, proc in active_downloads.items():
-            status_text += f"  • User {uid} (PID {proc.pid})\n"
+        for uid, info in active_downloads.items():
+            proc = info.get("proc")
+            pid = proc.pid if proc else "?"
+            status_text += f"  • User {uid} (PID {pid})\n"
 
     await u.message.reply_text(status_text)
 
@@ -442,29 +501,40 @@ async def cmd_queue(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_cancel(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Handle cancel button press — kills the async subprocess immediately."""
+    """Handle cancel button press — uses asyncio.Event for instant signaling."""
     user_id = u.callback_query.from_user.id
     query = u.callback_query
     await query.answer("Cancelling...")
 
     if user_id in active_downloads:
-        proc = active_downloads.pop(user_id)
+        # Signal cancel via Event (instant, no polling delay)
+        active_downloads[user_id]["cancel_event"].set()
+        # Also kill proc directly for safety
+        proc = active_downloads[user_id].get("proc")
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # Clear queue
+        download_queues.pop(user_id, None)
         try:
-            proc.kill()
-            await asyncio.wait_for(proc.wait(), timeout=5)
+            await query.edit_message_text("❌ Download cancelled. Queue cleared.")
         except Exception:
             pass
-        # Also clear queue
-        download_queues.pop(user_id, None)
-        await query.edit_message_text("❌ Download cancelled. Queue cleared.")
-        log.info(f"User {user_id} cancelled download (PID {proc.pid})")
+        log.info(f"User {user_id} cancelled download (PID {proc.pid if proc else '?'})")
     else:
-        # No active download — clear queue instead
         queue = download_queues.pop(user_id, None)
         if queue:
-            await query.edit_message_text(f"❌ Queue cleared ({len(queue)} items removed).")
+            try:
+                await query.edit_message_text(f"❌ Queue cleared ({len(queue)} items removed).")
+            except Exception:
+                pass
         else:
-            await query.edit_message_text("ℹ️ No active download to cancel.")
+            try:
+                await query.edit_message_text("ℹ️ No active download to cancel.")
+            except Exception:
+                pass
 
 
 async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -508,7 +578,13 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ])
     status = await u.message.reply_text("⏳ Starting...", reply_markup=keyboard)
 
-    # Store for queue processing
+    # Set up cancel event for this download
+    cancel_event = asyncio.Event()
+    active_downloads[user_id] = {
+        "proc": None,
+        "cancel_event": cancel_event,
+        "status_msg_id": status.message_id,
+    }
     download_queues[user_id] = []
 
     try:
