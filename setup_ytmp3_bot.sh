@@ -119,7 +119,7 @@ source venv/bin/activate
 
 # Upgrade yt-dlp to latest nightly for best YouTube compatibility
 pip install --quiet --upgrade pip
-pip install --quiet python-telegram-bot[job-queue] requests
+pip install --quiet python-telegram-bot[job-queue] requests Pillow mutagen
 pip install --quiet --upgrade yt-dlp
 
 info "yt-dlp version: $(python3 -m yt_dlp --version)"
