@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════
-# YouTube MP3 Bot — Quick Update Script v2
+# YouTube MP3 Bot — Quick Update Script v3
 # Run this on the VPS to pull the latest bot version from GitHub
 # ══════════════════════════════════════════════════════════════
 
@@ -21,10 +21,11 @@ echo "✅ Bot script updated ($(wc -l < "$BOT_DIR/bot.py") lines)"
 echo "📦 Installing system dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq 2>&1 | tail -1
-for pkg in libjpeg62-turbo zlib1g-dev libfreetype6-dev liblcms2-dev libopenjp2-7-dev libtiff5-dev libwebp-dev tcl8.6-dev tk8.6-dev; do
-    dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || apt-get install -y -qq "$pkg" 2>&1 | tail -1
+# Ubuntu 24.04 uses libjpeg-turbo8 (not libjpeg62-turbo)
+for pkg in libjpeg-turbo8 libjpeg-turbo8-dev zlib1g-dev libfreetype6-dev liblcms2-dev libopenjp2-7-dev libtiff5-dev libwebp-dev; do
+    dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || apt-get install -y -qq "$pkg" 2>&1 | tail -1 || echo "⚠️  Skipped: $pkg"
 done
-echo "✅ System deps installed"
+echo "✅ System deps done"
 
 # ── Step 3: Install Python deps ──
 echo "🐍 Installing Python dependencies..."
@@ -37,12 +38,15 @@ echo "🔍 Verifying imports..."
 if "$BOT_DIR/venv/bin/python3" -c "import requests; from PIL import Image; from mutagen.mp3 import MP3; print('All imports OK')" 2>&1; then
     echo "✅ All imports verified"
 else
-    echo "❌ Import check failed!"
-    "$BOT_DIR/venv/bin/python3" -c "import requests; from PIL import Image; from mutagen.mp3 import MP3" 2>&1
-    exit 1
+    echo "❌ Import check failed — trying fresh install..."
+    pip install --force-reinstall --quiet Pillow mutagen 2>&1 | tail -3
+    "$BOT_DIR/venv/bin/python3" -c "import requests; from PIL import Image; from mutagen.mp3 import MP3; print('All imports OK')" 2>&1 || { echo "❌ Still failing"; exit 1; }
 fi
 
-# ── Step 5: Restart service ──
+# ── Step 5: Clear pycache ──
+rm -rf "$BOT_DIR/__pycache__" "$BOT_DIR"/**/__pycache__ 2>/dev/null || true
+
+# ── Step 6: Restart service ──
 echo "🔄 Restarting bot service..."
 systemctl restart ytmp3-bot
 sleep 3
