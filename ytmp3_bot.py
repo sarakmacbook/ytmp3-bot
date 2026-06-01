@@ -272,6 +272,31 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 
+async def cmd_update(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Pull latest bot from GitHub and restart."""
+    import getpass
+    # Only allow the bot owner (you) to run this
+    allowed_users = os.environ.get("BOT_OWNER_ID", "")
+    user_id = str(u.message.from_user.id)
+    if allowed_users and user_id not in allowed_users.split(","):
+        await u.message.reply_text("⛔ Not authorized.")
+        return
+
+    msg = await u.message.reply_text("🔄 Updating...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["bash", "/opt/ytmp3-bot/update.sh"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            await msg.edit_text("✅ Update complete! Bot restarted.")
+        else:
+            await msg.edit_text(f"❌ Update failed:\n{result.stderr[:300]}")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN not set!"); sys.exit(1)
@@ -279,6 +304,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CallbackQueryHandler(handle_cancel, pattern="^cancel$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot running.")
