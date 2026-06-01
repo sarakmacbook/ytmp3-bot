@@ -43,12 +43,12 @@ fi
 
 if [ -n "$EXISTING_TOKEN" ]; then
     info "Existing bot token found: ${EXISTING_TOKEN:0:10}...${EXISTING_TOKEN: -5}"
-    read -p "Use existing token? (y/n): " USE_EXISTING
+    read -p "Use existing token? (y/n): " USE_EXISTING </dev/tty
     if [ "$USE_EXISTING" = "y" ] || [ "$USE_EXISTING" = "Y" ]; then
         BOT_TOKEN="$EXISTING_TOKEN"
         info "Reusing existing token."
     else
-        read -p "Paste new Telegram Bot Token: " BOT_TOKEN
+        read -p "Paste new Telegram Bot Token: " BOT_TOKEN </dev/tty
     fi
 else
     echo "Get your bot token from @BotFather:"
@@ -57,7 +57,7 @@ else
     echo "  3. Choose a name + username"
     echo "  4. Copy the API token"
     echo ""
-    read -p "Paste your Telegram Bot Token: " BOT_TOKEN
+    read -p "Paste your Telegram Bot Token: " BOT_TOKEN </dev/tty
 fi
 
 if [ -z "$BOT_TOKEN" ]; then
@@ -67,7 +67,7 @@ fi
 
 if [[ ! "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
     warn "Token format looks unusual."
-    read -p "Continue anyway? (y/n): " CONT
+    read -p "Continue anyway? (y/n): " CONT </dev/tty
     [ "$CONT" != "y" ] && exit 1
 fi
 
