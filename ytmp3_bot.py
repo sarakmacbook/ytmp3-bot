@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""YouTube MP3 Telegram Bot v4.5 — cancel button + thumbnail art."""
+"""YouTube MP3 Telegram Bot v5 — async download, progress bar, cancel, thumbnail art."""
 
-import os, sys, re, subprocess, logging, tempfile, traceback, base64, io
+import os, sys, re, asyncio, logging, tempfile, traceback, base64, io
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -21,10 +21,15 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 log = logging.getLogger(__name__)
 
 # ─── Track active downloads per user ───────────────────────
-active_downloads = {}  # user_id -> subprocess.Popen
+active_downloads = {}  # user_id -> asyncio.subprocess.Process
 
 # ─── Optional proxy ────────────────────────────────────────
 PROXY = os.environ.get("SOCKS_PROXY", "")
+
+# ─── Progress bar chars ────────────────────────────────────
+BAR_FILL = "▓"
+BAR_EMPTY = "░"
+BAR_WIDTH = 16
 
 
 def clean_url(url):
@@ -63,7 +68,6 @@ def download_thumbnail(video_id):
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200 and len(r.content) > 1000:
-                # Convert to JPEG if needed
                 img = Image.open(io.BytesIO(r.content))
                 if img.mode in ("RGBA", "P"):
                     img = img.convert("RGB")
@@ -82,10 +86,7 @@ def embed_album_art(mp3_path, thumbnail_bytes, title=""):
         audio = MP3(str(mp3_path))
         if audio.tags is None:
             audio.add_tags()
-        audio.tags.add(APIC(
-            encoding=3, mime="image/jpeg", type=3,
-            desc="Cover", data=thumbnail_bytes
-        ))
+        audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=thumbnail_bytes))
         if title:
             audio.tags.add(TIT2(encoding=3, text=title))
         audio.tags.add(TPE1(encoding=3, text="YouTube"))
@@ -95,70 +96,216 @@ def embed_album_art(mp3_path, thumbnail_bytes, title=""):
         log.warning(f"Could not embed art: {e}")
 
 
-def build_ydl_opts(url, out_dir):
-    """Build yt-dlp options with cookie auth + JS runtime."""
+def build_ydl_cmd(url, out_dir):
+    """Build yt-dlp command with cookie auth + JS runtime."""
     tmpl = str(out_dir / "%(title)s-%(id)s.%(ext)s")
-    opts = [
+    cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-playlist",
         "-f", "bestaudio/best",
         "-o", tmpl,
         "--no-warnings",
-        "--quiet",
+        "--newline",          # progress on separate lines
+        "-q", "--progress",   # progress bar to stderr
     ]
     if Path(COOKIE_FILE).exists():
-        opts.extend(["--cookies", COOKIE_FILE])
-        log.info(f"Using cookies: {COOKIE_FILE}")
-    else:
-        log.warning("No cookie file found, trying without auth")
+        cmd.extend(["--cookies", COOKIE_FILE])
     if PROXY:
-        opts.extend(["--proxy", PROXY])
-    opts.extend(["--extractor-args", "youtube:player_client=web"])
-    opts.extend(["--js-runtimes", "node"])
-    opts.append(url)
-    return opts
+        cmd.extend(["--proxy", PROXY])
+    cmd.extend(["--extractor-args", "youtube:player_client=web"])
+    cmd.extend(["--js-runtimes", "node"])
+    cmd.append(url)
+    return cmd
 
 
-def download_and_convert(url, out_dir):
+def format_eta(seconds):
+    """Format seconds to human readable ETA."""
+    if not seconds or seconds <= 0:
+        return "calculating"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}:{s:02d}"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def make_progress_bar(pct, speed_mbps, eta_sec):
+    """Build progress bar string."""
+    filled = int(BAR_WIDTH * pct / 100)
+    bar = BAR_FILL * filled + BAR_EMPTY * (BAR_WIDTH - filled)
+    eta_str = format_eta(eta_sec)
+    speed_str = f"{speed_mbps:.1f}" if speed_mbps and speed_mbps > 0 else "?"
+    return f"{bar} {pct:.0f}% • {speed_str} MB/s • {eta_str} left"
+
+
+def parse_ydl_progress(line):
+    """Parse a yt-dlp progress line. Returns (pct, speed_mbps, eta_sec) or None."""
+    # yt-dlp progress looks like: [download]  45.3% of ~123.45MiB at 2.34MiB/s ETA 01:23
+    m = re.search(
+        r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?(\d+\.?\d*)([KMGT]i?B)\s+at\s+(\d+\.?\d*)([KMGT]i?B)/s\s+ETA\s+(\d+:\d+(?::\d+)?)',
+        line
+    )
+    if m:
+        pct = float(m.group(1))
+        speed_val = float(m.group(4))
+        speed_unit = m.group(5)
+        # Convert to MB/s
+        multiplier = {"B": 1/1048576, "KiB": 1/1024, "MiB": 1, "GiB": 1024,
+                       "K": 1/1048576, "M": 1, "G": 1024, "T": 1048576}
+        speed_mbps = speed_val * multiplier.get(speed_unit, 1)
+        # Parse ETA
+        eta_parts = m.group(6).split(":")
+        eta_sec = sum(int(x) * 60**i for i, x in enumerate(reversed(eta_parts)))
+        return pct, speed_mbps, eta_sec
+
+    # Simpler fallback: just percentage
+    m2 = re.search(r'\[download\]\s+(\d+\.?\d*)%', line)
+    if m2:
+        return float(m2.group(1)), None, None
+
+    return None
+
+
+async def async_download_and_convert(url, out_dir, user_id, status_msg, context):
+    """
+    Async download with live progress updates.
+    Returns (mp3_path, error_string).
+    Cancels cleanly if user presses cancel.
+    """
     url = clean_url(url)
     log.info(f"Clean URL: {url}")
+
     for f in out_dir.glob("*"):
         try: f.unlink()
         except: pass
-    cmd = build_ydl_opts(url, out_dir)
-    log.info(f"Running yt-dlp...")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    log.info(f"yt-dlp exit={r.returncode}")
-    if r.returncode != 0:
-        log.error(f"Download failed: {r.stderr[:500]}")
-        return None, r.stderr[:400]
-    found = []
-    for ext in ("m4a", "mp4", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
-        found.extend(out_dir.glob(f"*.{ext}"))
-    if not found:
-        return None, "No audio file produced"
-    src = found[0]
-    mp3 = src.with_suffix(".mp3")
-    r2 = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src), "-vn", "-ar", "44100", "-ac", "2",
-         "-b:a", f"{AUDIO_QUALITY}k", "-metadata", "encoder=YTMP3Bot", str(mp3)],
-        capture_output=True, text=True, timeout=300,
-    )
-    if r2.returncode != 0:
-        return None, f"FFmpeg failed: {r2.stderr[:200]}"
-    if src != mp3 and src.exists():
-        src.unlink()
-    return mp3, None
+
+    cmd = build_ydl_cmd(url, out_dir)
+    log.info(f"Starting async yt-dlp: {' '.join(cmd[:5])}...")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Track for cancel
+        active_downloads[user_id] = proc
+
+        # Read stderr (where yt-dlp writes progress) line by line
+        last_update = asyncio.get_event_loop().time()
+        progress_text = "⏳ Starting download..."
+
+        while True:
+            try:
+                line_bytes = await asyncio.wait_for(proc.stderr.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # Check if process finished
+                if proc.returncode is not None:
+                    break
+                # Check if cancelled
+                if user_id not in active_downloads:
+                    return None, "Cancelled"
+                continue
+
+            if not line_bytes:
+                if proc.returncode is not None:
+                    break
+                continue
+
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            parsed = parse_ydl_progress(line)
+
+            if parsed:
+                pct, speed, eta = parsed
+                progress_text = make_progress_bar(pct, speed or 0, eta or 0)
+
+                # Update Telegram every 2 seconds (rate limit friendly)
+                now = asyncio.get_event_loop().time()
+                if now - last_update >= 2.0:
+                    last_update = now
+                    try:
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+                        ])
+                        await status_msg.edit_text(progress_text, reply_markup=keyboard)
+                    except Exception:
+                        pass  # rate limit or message deleted
+
+            # Check if cancelled between lines
+            if user_id not in active_downloads:
+                proc.kill()
+                await proc.wait()
+                return None, "Cancelled"
+
+        # Process finished
+        await proc.wait()
+
+        if user_id not in active_downloads:
+            return None, "Cancelled"
+
+        if proc.returncode != 0:
+            stderr_out = await proc.stderr.read()
+            err_text = stderr_out.decode("utf-8", errors="replace")[:500]
+            log.error(f"yt-dlp failed (exit {proc.returncode}): {err_text}")
+            return None, err_text
+
+        # Find downloaded file
+        found = []
+        for ext in ("m4a", "mp4", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
+            found.extend(out_dir.glob(f"*.{ext}"))
+        if not found:
+            return None, "No audio file produced"
+
+        src = found[0]
+        mp3 = src.with_suffix(".mp3")
+
+        # Convert to MP3 with ffmpeg
+        try:
+            await status_msg.edit_text("🔄 Converting to MP3...")
+        except Exception:
+            pass
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", str(src), "-vn", "-ar", "44100", "-ac", "2",
+            "-b:a", f"{AUDIO_QUALITY}k", "-metadata", "encoder=YTMP3Bot", str(mp3)
+        ]
+        ff_proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await ff_proc.wait()
+
+        if ff_proc.returncode != 0:
+            err = (await ff_proc.stderr.read()).decode("utf-8", errors="replace")[:200]
+            return None, f"FFmpeg failed: {err}"
+
+        if src != mp3 and src.exists():
+            src.unlink()
+
+        return mp3, None
+
+    except asyncio.CancelledError:
+        return None, "Cancelled"
+    except Exception as e:
+        log.error(f"Download error: {e}\n{traceback.format_exc()}")
+        return None, str(e)[:300]
+    finally:
+        active_downloads.pop(user_id, None)
 
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "🎵 YouTube MP3 Bot v4\n\n"
+        "🎵 YouTube MP3 Bot v5\n\n"
         "Send any YouTube URL → get MP3 back\n\n"
         "Commands: /start /help\n"
         "Note: Max 60 min video\n"
-        "You can cancel with ❌ button while downloading"
+        "Progress bar + cancel button while downloading"
     )
+
 
 async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
@@ -166,27 +313,30 @@ async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Copy YouTube URL\n"
         "2️⃣ Send it here\n"
         "3️⃣ Wait for MP3\n\n"
-        "⏳ While downloading, tap ❌ Cancel to stop\n"
+        "⏳ Progress bar shows % / speed / ETA\n"
+        "❌ Tap Cancel to stop anytime\n"
         f"Quality: {AUDIO_QUALITY} kbps | Max: {MAX_DURATION//60} min"
     )
 
+
 async def handle_cancel(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Handle cancel button press."""
+    """Handle cancel button press — kills the async subprocess immediately."""
     user_id = u.callback_query.from_user.id
     query = u.callback_query
-    await query.answer()
+    await query.answer("Cancelling...")
 
     if user_id in active_downloads:
         proc = active_downloads.pop(user_id)
         try:
             proc.kill()
-            proc.wait(timeout=5)
+            await asyncio.wait_for(proc.wait(), timeout=5)
         except Exception:
             pass
         await query.edit_message_text("❌ Download cancelled.")
         log.info(f"User {user_id} cancelled download (PID {proc.pid})")
     else:
         await query.edit_message_text("ℹ️ No active download to cancel.")
+
 
 async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = u.message.text.strip()
@@ -214,21 +364,20 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         old_proc = active_downloads.pop(user_id)
         try:
             old_proc.kill()
-            old_proc.wait(timeout=3)
+            await asyncio.wait_for(old_proc.wait(), timeout=3)
         except Exception:
             pass
 
     log.info(f"URL: {url} (user {user_id})")
 
-    # Show "Downloading..." message with cancel button
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
-    status = await u.message.reply_text("⏳ Downloading...", reply_markup=keyboard)
+    status = await u.message.reply_text("⏳ Starting...", reply_markup=keyboard)
     req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_"))
 
     try:
-        mp3, err = download_and_convert(url, req_dir)
+        mp3, err = await async_download_and_convert(url, req_dir, user_id, status, c)
 
         # Remove cancel button
         try:
@@ -237,7 +386,11 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
 
         if not mp3 or not mp3.exists():
-            await status.edit_text(f"❌ Failed:\n{err[:400]}")
+            error_msg = err or "Unknown error"
+            if error_msg == "Cancelled":
+                # Already handled by cancel handler
+                return
+            await status.edit_text(f"❌ Failed:\n{error_msg[:400]}")
             return
 
         # ── Download & embed thumbnail ──
@@ -245,24 +398,23 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if video_id:
             thumb = download_thumbnail(video_id)
             if thumb:
-                title = mp3.stem
-                embed_album_art(mp3, thumb, title)
+                embed_album_art(mp3, thumb, mp3.stem)
 
         size_mb = mp3.stat().st_size / (1024 * 1024)
         await status.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
         with open(mp3, "rb") as f:
             await u.message.reply_audio(
-                audio=f, title=mp3.stem,
-                performer="YouTube",
+                audio=f, title=mp3.stem, performer="YouTube",
             )
         await status.delete()
         log.info(f"Sent: {mp3.name} ({size_mb:.1f} MB)")
 
-    except subprocess.TimeoutExpired:
-        await status.edit_text("❌ Timed out.")
     except Exception as e:
         log.error(f"Error: {e}\n{traceback.format_exc()}")
-        await status.edit_text(f"❌ Error: {str(e)[:200]}")
+        try:
+            await status.edit_text(f"❌ Error: {str(e)[:200]}")
+        except Exception:
+            pass
     finally:
         active_downloads.pop(user_id, None)
         for f in req_dir.glob("*"):
@@ -274,25 +426,23 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_update(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Pull latest bot from GitHub and restart."""
-    import getpass
-    # Only allow the bot owner (you) to run this
     allowed_users = os.environ.get("BOT_OWNER_ID", "")
     user_id = str(u.message.from_user.id)
     if allowed_users and user_id not in allowed_users.split(","):
         await u.message.reply_text("⛔ Not authorized.")
         return
-
     msg = await u.message.reply_text("🔄 Updating...")
     try:
-        import subprocess
-        result = subprocess.run(
-            ["bash", "/opt/ytmp3-bot/update.sh"],
-            capture_output=True, text=True, timeout=60
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "/opt/ytmp3-bot/update.sh",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode == 0:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode == 0:
             await msg.edit_text("✅ Update complete! Bot restarted.")
         else:
-            await msg.edit_text(f"❌ Update failed:\n{result.stderr[:300]}")
+            await msg.edit_text(f"❌ Update failed:\n{stderr.decode()[:300]}")
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
@@ -300,7 +450,7 @@ async def cmd_update(u: Update, c: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN not set!"); sys.exit(1)
-    log.info("Starting YT-MP3 Bot v4.5...")
+    log.info("Starting YT-MP3 Bot v5...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -309,6 +459,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot running.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
