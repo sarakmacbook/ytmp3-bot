@@ -88,45 +88,24 @@ def download_thumbnail(video_id):
 
 
 def embed_album_art(mp3_path, thumbnail_bytes, title=""):
-    """Embed thumbnail as album art in MP3 file using ffmpeg (most reliable)."""
+    """Embed thumbnail as album art in MP3 using eyed3 (most reliable for MP3)."""
     try:
-        # Save thumbnail to temp file
-        thumb_path = mp3_path.with_suffix(".jpg")
-        with open(thumb_path, "wb") as f:
-            f.write(thumbnail_bytes)
-
-        # Use ffmpeg to embed album art into MP3 (creates new file)
-        temp_mp3 = mp3_path.with_suffix(".tmp.mp3")
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", str(mp3_path),       # input audio
-                "-i", str(thumb_path),      # input thumbnail
-                "-map", "0", "-map", "1",   # map both inputs
-                "-c", "copy",               # copy streams (no re-encode)
-                "-id3v2_version", "3",      # ID3v2.3 for max compatibility
-                "-metadata:s:v", "title=Album cover",
-                "-metadata:s:v", "comment=Cover (front)",
-                "-metadata", f"title={title}" if title else "",
-                "-metadata", "artist=YouTube",
-                str(temp_mp3),
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-
-        thumb_path.unlink()  # clean up temp thumbnail
-
-        if result.returncode == 0:
-            # Replace original with tagged version
-            temp_mp3.replace(mp3_path)
-            log.info("Album art embedded via ffmpeg")
-        else:
-            log.warning(f"ffmpeg album art failed: {result.stderr[:200]}")
-            # Fallback to mutagen
-            _embed_album_art_mutagen(mp3_path, thumbnail_bytes, title)
-
+        import eyed3
+        audio = eyed3.load(str(mp3_path))
+        if audio.tag is None:
+            audio.initTag()
+        audio.tag.images.set(3, thumbnail_bytes, "image/jpeg", "Cover")
+        if title:
+            audio.tag.title = title
+        audio.tag.artist = "YouTube"
+        audio.tag.save()
+        log.info(f"Album art embedded via eyed3 ({len(thumbnail_bytes)} bytes)")
+    except ImportError:
+        log.warning("eyed3 not installed, trying mutagen fallback")
+        _embed_album_art_mutagen(mp3_path, thumbnail_bytes, title)
     except Exception as e:
-        log.warning(f"Could not embed art: {e}")
+        log.warning(f"eyed3 failed: {e}, trying mutagen fallback")
+        _embed_album_art_mutagen(mp3_path, thumbnail_bytes, title)
 
 
 def _embed_album_art_mutagen(mp3_path, thumbnail_bytes, title=""):
