@@ -15,7 +15,7 @@ from telegram.ext import (
     filters, ContextTypes,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN=os.environ.get("BOT_TOKEN", "")
 DOWNLOAD_DIR = Path(tempfile.mkdtemp(prefix="ytmp3_"))
 MAX_DURATION = 3600
 AUDIO_QUALITY = "192"
@@ -27,60 +27,92 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def download_and_convert(url: str, out_dir: Path):
+def download_and_convert(url, out_dir):
+    """Download YouTube audio and convert to MP3 using yt-dlp with bot bypass."""
     tmpl = str(out_dir / "%(title)s.%(ext)s")
-    r = subprocess.run(
-        [sys.executable, "-m", "yt_dlp",
-         "--no-playlist", "-f", "bestaudio/best",
-         "-o", tmpl, "--no-warnings", "--quiet", url],
-        capture_output=True, text=True, timeout=600,
-    )
-    if r.returncode != 0:
-        log.error("Download failed: %s", r.stderr[:300])
-        return None
 
+    # Clean any existing files first
+    for f in out_dir.glob("*"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+    dl_cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "-f", "bestaudio/best",
+        "-o", tmpl,
+        "--no-warnings",
+        # YouTube bot bypass: use PO token / impersonation
+        "--extractor-args", "youtube:player_client=android",
+        "--extractor-args", "youtube:po_token=web+",
+        url,
+    ]
+    log.info("Running yt-dlp for: %s", url)
+    r = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
+    log.info("yt-dlp exit=%d stderr_len=%d", r.returncode, len(r.stderr))
+
+    if r.returncode != 0:
+        log.error("Download failed: %s", r.stderr[:500])
+        # Retry with different approach
+        log.info("Retrying with web player client...")
+        dl_cmd2 = [
+            sys.executable, "-m", "yt_dlp",
+            "--no-playlist",
+            "-f", "bestaudio/best",
+            "-o", tmpl,
+            "--no-warnings",
+            "--extractor-args", "youtube:player_client=web",
+            url,
+        ]
+        r = subprocess.run(dl_cmd2, capture_output=True, text=True, timeout=600)
+        log.info("yt-dlp retry exit=%d", r.returncode)
+        if r.returncode != 0:
+            log.error("Retry also failed: %s", r.stderr[:500])
+            return None, r.stderr[:300]
+
+    # Find the downloaded file
     found = []
     for ext in ("m4a", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
         found.extend(out_dir.glob(f"*.{ext}"))
+
     if not found:
-        log.error("No audio files found")
-        return None
+        all_files = list(out_dir.glob("*"))
+        log.error("No audio files. All files: %s", [f.name for f in all_files])
+        return None, "No audio file produced"
 
     src = found[0]
     mp3 = src.with_suffix(".mp3")
 
-    r2 = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src),
-         "-vn", "-ar", "44100", "-ac", "2",
-         "-b:a", "%sk" % AUDIO_QUALITY,
-         "-metadata", "encoder=YTMP3Bot", str(mp3)],
-        capture_output=True, text=True, timeout=300,
-    )
+    ff_cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vn", "-ar", "44100", "-ac", "2",
+        "-b:a", "%sk" % AUDIO_QUALITY,
+        "-metadata", "encoder=YTMP3Bot",
+        str(mp3),
+    ]
+    r2 = subprocess.run(ff_cmd, capture_output=True, text=True, timeout=300)
     if r2.returncode != 0:
         log.error("FFmpeg failed: %s", r2.stderr[:300])
-        return src if src.suffix == ".mp3" else None
+        return None, "FFmpeg conversion failed"
 
     if src != mp3 and src.exists():
         src.unlink()
-    return mp3
+
+    return mp3, None
 
 
-def cleanup(d: Path):
-    for f in d.glob("*"):
-        try: f.unlink()
-        except: pass
-
-
-async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(u, c):
     await u.message.reply_text(
         "YouTube MP3 Bot\n\n"
-        "Send me any YouTube URL and I'll send back the MP3!\n\n"
-        "/start — This message\n"
-        "/help — How to use"
+        "Send me any YouTube URL and I will send back the MP3!\n\n"
+        "/start -- This message\n"
+        "/help -- How to use"
     )
 
 
-async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(u, c):
     await u.message.reply_text(
         "How to use:\n\n"
         "1. Copy a YouTube video URL\n"
@@ -91,23 +123,37 @@ async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def handle_text(u, c):
     text = u.message.text.strip()
-    m = re.search(r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+)', text)
-    if not m:
-        await u.message.reply_text("Send a YouTube URL.\nExample: https://youtube.com/watch?v=...")
-        return
-    url = m.group(1)
 
+    patterns = [
+        r'(https?://(?:www\.)?youtube\.com/watch\?\S+)',
+        r'(https?://(?:www\.)?youtube\.com/shorts/\S+)',
+        r'(https?://youtu\.be/\S+)',
+        r'(https?://(?:www\.)?youtube\.com/embed/\S+)',
+    ]
+    url = None
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            url = m.group(1)
+            break
+
+    if not url:
+        await u.message.reply_text("Send a YouTube URL.\nExample: https://www.youtube.com/watch?v=...")
+        return
+
+    log.info("Processing URL: %s", url)
     status = await u.message.reply_text("Downloading...")
-    req_dir = DOWNLOAD_DIR / ("req_%d" % u.message.message_id)
-    req_dir.mkdir(exist_ok=True)
+
+    req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_req_"))
 
     try:
-        mp3 = download_and_convert(url, req_dir)
+        mp3, error_msg = download_and_convert(url, req_dir)
         if not mp3 or not mp3.exists():
-            await status.edit_text("Failed. Check URL and try again.")
-            cleanup(req_dir)
+            err = error_msg or "Unknown error"
+            log.error("Failed: %s", err)
+            await status.edit_text("Failed: %s" % err[:300])
             return
 
         size_mb = mp3.stat().st_size / (1024 * 1024)
@@ -124,15 +170,20 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         log.info("Sent: %s (%.1f MB)", mp3.name, size_mb)
 
     except subprocess.TimeoutExpired:
-        await status.edit_text("Timed out.")
+        log.error("Timeout")
+        await status.edit_text("Timed out. Video may be too long.")
     except Exception as e:
         log.error("Error: %s", e)
         await status.edit_text("Error: %s" % str(e)[:200])
     finally:
-        cleanup(req_dir)
+        for f in req_dir.glob("*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
         try:
             req_dir.rmdir()
-        except:
+        except Exception:
             pass
 
 
