@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """YouTube MP3 Telegram Bot v3 — with cookie-based auth."""
 
-import os, sys, re, subprocess, logging, tempfile, traceback
+import os, sys, re, subprocess, logging, tempfile, traceback, base64
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
