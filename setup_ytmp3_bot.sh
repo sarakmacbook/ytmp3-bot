@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# Allow token as first argument: bash setup.sh BOT_TOKEN_HERE
+TOKEN_FROM_ARG="${1:-}"
+
 BOT_DIR="/opt/ytmp3-bot"
 SERVICE_NAME="ytmp3-bot"
 PYTHON="/usr/bin/python3"
@@ -41,8 +44,12 @@ if [ -f "$BOT_DIR/.env" ]; then
     EXISTING_TOKEN=$(grep -oP 'BOT_TOKEN=\K.*' "$BOT_DIR/.env" 2>/dev/null || true)
 fi
 
-if [ -n "$EXISTING_TOKEN" ]; then
-    info "Existing bot token found: ${EXISTING_TOKEN:0:10}...${EXISTING_TOKEN: -5}"
+# Priority: 1) command-line arg, 2) existing .env, 3) interactive prompt
+if [ -n "$TOKEN_FROM_ARG" ]; then
+    BOT_TOKEN="$TOKEN_FROM_ARG"
+    info "Using token from command-line argument."
+elif [ -n "$EXISTING_TOKEN" ]; then
+    info "Existing bot token found: ${EXISTING_TOKEN:0:10}..."
     read -p "Use existing token? (y/n): " USE_EXISTING </dev/tty
     if [ "$USE_EXISTING" = "y" ] || [ "$USE_EXISTING" = "Y" ]; then
         BOT_TOKEN="$EXISTING_TOKEN"
