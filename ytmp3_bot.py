@@ -418,8 +418,9 @@ async def process_queue(user_id, url, status_msg, context):
             await status_msg.edit_text(human_error(error_msg))
             return
 
-        # ── Embed thumbnail as album art ──
+        # ── Thumbnail: embed in MP3 + send as photo for Telegram ──
         video_id = extract_video_id(url)
+        thumb_bytes = None
         if video_id:
             thumb_bytes = download_thumbnail(video_id)
             if thumb_bytes:
@@ -428,6 +429,22 @@ async def process_queue(user_id, url, status_msg, context):
         size_mb = mp3.stat().st_size / (1024 * 1024)
         await status_msg.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
         chat_id = status_msg.chat_id
+
+        # Send thumbnail as photo first (Telegram shows this as audio cover)
+        if thumb_bytes:
+            try:
+                from telegram import InputFile
+                thumb_io = io.BytesIO(thumb_bytes)
+                thumb_io.name = "cover.jpg"
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(thumb_io, filename="cover.jpg"),
+                    caption=f"🎵 {mp3.stem}\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
+                )
+            except Exception as e:
+                log.warning(f"Could not send thumbnail photo: {e}")
+
+        # Send MP3 audio
         with open(mp3, "rb") as f:
             await context.bot.send_audio(
                 chat_id=chat_id,
@@ -628,8 +645,9 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await process_next_in_queue(user_id, c)
             return
 
-        # ── Embed thumbnail as album art ──
+        # ── Thumbnail: embed in MP3 + send as photo for Telegram ──
         video_id = extract_video_id(url)
+        thumb_bytes = None
         if video_id:
             thumb_bytes = download_thumbnail(video_id)
             if thumb_bytes:
@@ -637,6 +655,21 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         size_mb = mp3.stat().st_size / (1024 * 1024)
         await status.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
+
+        # Send thumbnail as photo first (Telegram shows this as audio cover)
+        if thumb_bytes:
+            try:
+                from telegram import InputFile
+                thumb_io = io.BytesIO(thumb_bytes)
+                thumb_io.name = "cover.jpg"
+                await u.message.reply_photo(
+                    photo=InputFile(thumb_io, filename="cover.jpg"),
+                    caption=f"🎵 {mp3.stem}\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
+                )
+            except Exception as e:
+                log.warning(f"Could not send thumbnail photo: {e}")
+
+        # Send MP3 audio
         with open(mp3, "rb") as f:
             await u.message.reply_audio(
                 audio=f, title=mp3.stem, performer="YouTube",
