@@ -30,7 +30,7 @@ echo "✅ System deps done"
 # ── Step 3: Install Python deps ──
 echo "🐍 Installing Python dependencies..."
 source "$BOT_DIR/venv/bin/activate"
-pip install --quiet Pillow mutagen 2>&1 | tail -3
+pip install --quiet Pillow eyed3 mutagen 2>&1 | tail -3
 echo "✅ Python deps installed"
 
 # ── Step 4: Verify imports ──
