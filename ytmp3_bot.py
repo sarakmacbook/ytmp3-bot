@@ -1,136 +1,130 @@
 #!/usr/bin/env python3
-"""YouTube MP3 Telegram Bot — Send a YouTube URL, get back MP3."""
+"""YouTube MP3 Telegram Bot v3 — with cookie-based auth."""
 
-import os
-import sys
-import re
-import subprocess
-import logging
-import tempfile
+import os, sys, re, subprocess, logging, tempfile, traceback
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN=os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOWNLOAD_DIR = Path(tempfile.mkdtemp(prefix="ytmp3_"))
-MAX_DURATION = 3600
 AUDIO_QUALITY = "192"
+MAX_DURATION = 3600
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# ─── Cookie file path (set via env or default) ────────────
+COOKIE_FILE = os.environ.get("COOKIE_FILE", "/opt/ytmp3-bot/cookies.txt")
+
+# ─── Optional proxy ────────────────────────────────────────
+PROXY = os.environ.get("SOCKS_PROXY", "")
+
+
+def clean_url(url):
+    """Remove tracking parameters from YouTube URLs."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=False)
+    for trap in ("si", "feature", "gclid", "utm_source", "utm_medium", "utm_campaign"):
+        params.pop(trap, None)
+    clean_query = urlencode(params, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
+
+
+def build_ydl_opts(url, out_dir):
+    """Build yt-dlp options with cookie auth + fallbacks."""
+    tmpl = str(out_dir / "%(title)s-%(id)s.%(ext)s")
+    opts = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "-f", "bestaudio[abr<=256]/bestaudio/best",
+        "-o", tmpl,
+        "--no-warnings",
+        "--quiet",
+    ]
+    # Cookie file (primary auth method)
+    if COOKIE_FILE and Path(COOKIE_FILE).exists():
+        opts.extend(["--cookies", COOKIE_FILE])
+        log.info(f"Using cookies: {COOKIE_FILE}")
+    else:
+        log.warning("No cookie file found, trying without auth")
+
+    # Optional proxy
+    if PROXY:
+        opts.extend(["--proxy", PROXY])
+
+    # Player client order — ios first, then web_creator (least flagged)
+    opts.extend(["--extractor-args", "youtube:player_client=ios,web_creator,mweb,android"])
+    opts.append(url)
+    return opts
 
 
 def download_and_convert(url, out_dir):
-    """Download YouTube audio and convert to MP3 using yt-dlp with bot bypass."""
-    tmpl = str(out_dir / "%(title)s.%(ext)s")
+    url = clean_url(url)
+    log.info(f"Clean URL: {url}")
 
-    # Clean any existing files first
     for f in out_dir.glob("*"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
+        try: f.unlink()
+        except: pass
 
-    dl_cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist",
-        "-f", "bestaudio/best",
-        "-o", tmpl,
-        "--no-warnings",
-        # YouTube bot bypass: use PO token / impersonation
-        "--extractor-args", "youtube:player_client=android",
-        "--extractor-args", "youtube:po_token=web+",
-        url,
-    ]
-    log.info("Running yt-dlp for: %s", url)
-    r = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
-    log.info("yt-dlp exit=%d stderr_len=%d", r.returncode, len(r.stderr))
+    cmd = build_ydl_opts(url, out_dir)
+    log.info(f"Running yt-dlp (cookies={'yes' if Path(COOKIE_FILE).exists() else 'NO'})...")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    log.info(f"yt-dlp exit={r.returncode}")
 
     if r.returncode != 0:
-        log.error("Download failed: %s", r.stderr[:500])
-        # Retry with different approach
-        log.info("Retrying with web player client...")
-        dl_cmd2 = [
-            sys.executable, "-m", "yt_dlp",
-            "--no-playlist",
-            "-f", "bestaudio/best",
-            "-o", tmpl,
-            "--no-warnings",
-            "--extractor-args", "youtube:player_client=web",
-            url,
-        ]
-        r = subprocess.run(dl_cmd2, capture_output=True, text=True, timeout=600)
-        log.info("yt-dlp retry exit=%d", r.returncode)
-        if r.returncode != 0:
-            log.error("Retry also failed: %s", r.stderr[:500])
-            return None, r.stderr[:300]
+        log.error(f"Download failed: {r.stderr[:500]}")
+        return None, r.stderr[:400]
 
-    # Find the downloaded file
     found = []
-    for ext in ("m4a", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
+    for ext in ("m4a", "mp4", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
         found.extend(out_dir.glob(f"*.{ext}"))
-
     if not found:
-        all_files = list(out_dir.glob("*"))
-        log.error("No audio files. All files: %s", [f.name for f in all_files])
         return None, "No audio file produced"
-
     src = found[0]
+
     mp3 = src.with_suffix(".mp3")
-
-    ff_cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-vn", "-ar", "44100", "-ac", "2",
-        "-b:a", "%sk" % AUDIO_QUALITY,
-        "-metadata", "encoder=YTMP3Bot",
-        str(mp3),
-    ]
-    r2 = subprocess.run(ff_cmd, capture_output=True, text=True, timeout=300)
+    r2 = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-vn", "-ar", "44100", "-ac", "2",
+         "-b:a", f"{AUDIO_QUALITY}k", "-metadata", "encoder=YTMP3Bot", str(mp3)],
+        capture_output=True, text=True, timeout=300,
+    )
     if r2.returncode != 0:
-        log.error("FFmpeg failed: %s", r2.stderr[:300])
-        return None, "FFmpeg conversion failed"
-
+        return None, f"FFmpeg failed: {r2.stderr[:200]}"
     if src != mp3 and src.exists():
         src.unlink()
-
     return mp3, None
 
 
-async def cmd_start(u, c):
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "YouTube MP3 Bot\n\n"
-        "Send me any YouTube URL and I will send back the MP3!\n\n"
-        "/start -- This message\n"
-        "/help -- How to use"
+        "🎵 YouTube MP3 Bot v3\n\n"
+        "Send any YouTube URL → get MP3 back\n\n"
+        "Commands: /start /help\n"
+        "Note: Max 60 min video"
     )
 
-
-async def cmd_help(u, c):
+async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    cookie_status = "✅ Cookies loaded" if Path(COOKIE_FILE).exists() else "❌ No cookies"
     await u.message.reply_text(
-        "How to use:\n\n"
-        "1. Copy a YouTube video URL\n"
-        "2. Paste it here\n"
-        "3. Wait for the MP3 file\n\n"
-        "Supports: youtube.com, youtu.be, shorts\n\n"
-        "Max: %d min | Quality: %s kbps" % (MAX_DURATION // 60, AUDIO_QUALITY)
+        "📖 How to use:\n\n"
+        "1️⃣ Copy YouTube URL\n"
+        "2️⃣ Send it here\n"
+        "3️⃣ Wait for MP3\n\n"
+        f"Auth: {cookie_status}\n"
+        f"Quality: {AUDIO_QUALITY} kbps | Max: {MAX_DURATION//60} min"
     )
 
-
-async def handle_text(u, c):
+async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = u.message.text.strip()
-
     patterns = [
         r'(https?://(?:www\.)?youtube\.com/watch\?\S+)',
         r'(https?://(?:www\.)?youtube\.com/shorts/\S+)',
         r'(https?://youtu\.be/\S+)',
         r'(https?://(?:www\.)?youtube\.com/embed/\S+)',
+        r'(https?://music\.youtube\.com/watch\?\S+)',
     ]
     url = None
     for pat in patterns:
@@ -138,67 +132,53 @@ async def handle_text(u, c):
         if m:
             url = m.group(1)
             break
-
     if not url:
-        await u.message.reply_text("Send a YouTube URL.\nExample: https://www.youtube.com/watch?v=...")
+        await u.message.reply_text("⚠️ Send a YouTube URL.\nExample: https://youtube.com/watch?v=...")
         return
 
-    log.info("Processing URL: %s", url)
-    status = await u.message.reply_text("Downloading...")
-
-    req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_req_"))
+    log.info(f"URL: {url}")
+    status = await u.message.reply_text("⏳ Downloading...")
+    req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_"))
 
     try:
-        mp3, error_msg = download_and_convert(url, req_dir)
+        mp3, err = download_and_convert(url, req_dir)
         if not mp3 or not mp3.exists():
-            err = error_msg or "Unknown error"
-            log.error("Failed: %s", err)
-            await status.edit_text("Failed: %s" % err[:300])
+            await status.edit_text(f"❌ Failed:\n{err[:400]}")
             return
 
         size_mb = mp3.stat().st_size / (1024 * 1024)
-        await status.edit_text("Uploading... (%.1f MB)" % size_mb)
-
+        await status.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
         with open(mp3, "rb") as f:
             await u.message.reply_audio(
-                audio=f,
-                title=mp3.stem,
-                caption="YouTube MP3 Bot",
-                performer="YouTube",
+                audio=f, title=mp3.stem,
+                caption="🎵 YT-MP3", performer="YouTube",
             )
         await status.delete()
-        log.info("Sent: %s (%.1f MB)", mp3.name, size_mb)
+        log.info(f"Sent: {mp3.name} ({size_mb:.1f} MB)")
 
     except subprocess.TimeoutExpired:
-        log.error("Timeout")
-        await status.edit_text("Timed out. Video may be too long.")
+        await status.edit_text("❌ Timed out.")
     except Exception as e:
-        log.error("Error: %s", e)
-        await status.edit_text("Error: %s" % str(e)[:200])
+        log.error(f"Error: {e}\n{traceback.format_exc()}")
+        await status.edit_text(f"❌ Error: {str(e)[:200]}")
     finally:
         for f in req_dir.glob("*"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-        try:
-            req_dir.rmdir()
-        except Exception:
-            pass
+            try: f.unlink()
+            except: pass
+        try: req_dir.rmdir()
+        except: pass
 
 
 def main():
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN env var not set!")
-        sys.exit(1)
-    log.info("Starting YouTube MP3 Bot...")
+        log.error("BOT_TOKEN not set!"); sys.exit(1)
+    log.info("Starting YT-MP3 Bot v3 (with cookie auth)...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    log.info("Bot running. Ctrl+C to stop.")
+    log.info("Bot running.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
