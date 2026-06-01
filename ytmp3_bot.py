@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""YouTube MP3 Telegram Bot v4 — with cancel button support."""
+"""YouTube MP3 Telegram Bot v4.5 — cancel button + thumbnail art."""
 
-import os, sys, re, subprocess, logging, tempfile, traceback, base64
+import os, sys, re, subprocess, logging, tempfile, traceback, base64, io
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+import requests
+from PIL import Image
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -31,6 +35,64 @@ def clean_url(url):
         params.pop(trap, None)
     clean_query = urlencode(params, doseq=True)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, parsed.fragment))
+
+
+def extract_video_id(url):
+    """Extract YouTube video ID from URL."""
+    parsed = urlparse(url)
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.lstrip("/")
+    if parsed.hostname and "youtube" in parsed.hostname:
+        qs = parse_qs(parsed.query)
+        if "v" in qs:
+            return qs["v"][0]
+        m = re.match(r"/(?:shorts|embed)/([a-zA-Z0-9_-]+)", parsed.path)
+        if m:
+            return m.group(1)
+    return None
+
+
+def download_thumbnail(video_id):
+    """Download YouTube thumbnail, return JPEG bytes or None."""
+    urls = [
+        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                # Convert to JPEG if needed
+                img = Image.open(io.BytesIO(r.content))
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                log.info(f"Thumbnail from {url} ({len(buf.getvalue())} bytes)")
+                return buf.getvalue()
+        except Exception as e:
+            log.debug(f"Thumbnail fail {url}: {e}")
+    return None
+
+
+def embed_album_art(mp3_path, thumbnail_bytes, title=""):
+    """Embed thumbnail as album art in MP3 file."""
+    try:
+        audio = MP3(str(mp3_path))
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.add(APIC(
+            encoding=3, mime="image/jpeg", type=3,
+            desc="Cover", data=thumbnail_bytes
+        ))
+        if title:
+            audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text="YouTube"))
+        audio.save()
+        log.info("Album art embedded")
+    except Exception as e:
+        log.warning(f"Could not embed art: {e}")
 
 
 def build_ydl_opts(url, out_dir):
@@ -166,7 +228,6 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_"))
 
     try:
-        # Remove cancel button after a short delay (if download is fast)
         mp3, err = download_and_convert(url, req_dir)
 
         # Remove cancel button
@@ -179,12 +240,20 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"❌ Failed:\n{err[:400]}")
             return
 
+        # ── Download & embed thumbnail ──
+        video_id = extract_video_id(url)
+        if video_id:
+            thumb = download_thumbnail(video_id)
+            if thumb:
+                title = mp3.stem
+                embed_album_art(mp3, thumb, title)
+
         size_mb = mp3.stat().st_size / (1024 * 1024)
         await status.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
         with open(mp3, "rb") as f:
             await u.message.reply_audio(
                 audio=f, title=mp3.stem,
-                caption="🎵 YT-MP3", performer="YouTube",
+                performer="YouTube",
             )
         await status.delete()
         log.info(f"Sent: {mp3.name} ({size_mb:.1f} MB)")
@@ -195,7 +264,6 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         log.error(f"Error: {e}\n{traceback.format_exc()}")
         await status.edit_text(f"❌ Error: {str(e)[:200]}")
     finally:
-        # Clean up active download tracking
         active_downloads.pop(user_id, None)
         for f in req_dir.glob("*"):
             try: f.unlink()
@@ -207,7 +275,7 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN not set!"); sys.exit(1)
-    log.info("Starting YT-MP3 Bot v4...")
+    log.info("Starting YT-MP3 Bot v4.5...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
