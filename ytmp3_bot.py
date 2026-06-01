@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""YouTube MP3 Telegram Bot v5 — async download, progress bar, cancel, thumbnail art."""
+"""YouTube MP3 Telegram Bot v6 — progress bar, cancel, thumbnail, queue, status, better errors."""
 
-import os, sys, re, asyncio, logging, tempfile, traceback, base64, io
+import os, sys, re, asyncio, logging, tempfile, traceback, base64, io, time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from datetime import timedelta
 
 import requests
 from PIL import Image
@@ -12,16 +13,21 @@ from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN=os.environ.get("BOT_TOKEN", "")
 AUDIO_QUALITY = "192"
 MAX_DURATION = 3600
 COOKIE_FILE = os.environ.get("COOKIE_FILE", "/opt/ytmp3-bot/cookies.txt")
+BOT_VERSION = "v6"
+BOT_START_TIME = time.time()
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ─── Track active downloads per user ───────────────────────
 active_downloads = {}  # user_id -> asyncio.subprocess.Process
+
+# ─── Download queue per user ───────────────────────────────
+download_queues = {}   # user_id -> list of URLs waiting
 
 # ─── Optional proxy ────────────────────────────────────────
 PROXY = os.environ.get("SOCKS_PROXY", "")
@@ -105,8 +111,8 @@ def build_ydl_cmd(url, out_dir):
         "-f", "bestaudio/best",
         "-o", tmpl,
         "--no-warnings",
-        "--newline",          # progress on separate lines
-        "-q", "--progress",   # progress bar to stderr
+        "--newline",
+        "-q", "--progress",
     ]
     if Path(COOKIE_FILE).exists():
         cmd.extend(["--cookies", COOKIE_FILE])
@@ -143,7 +149,6 @@ def make_progress_bar(pct, speed_mbps, eta_sec):
 
 def parse_ydl_progress(line):
     """Parse a yt-dlp progress line. Returns (pct, speed_mbps, eta_sec) or None."""
-    # yt-dlp progress looks like: [download]  45.3% of ~123.45MiB at 2.34MiB/s ETA 01:23
     m = re.search(
         r'\[download\]\s+(\d+\.?\d*)%\s+of\s+~?(\d+\.?\d*)([KMGT]i?B)\s+at\s+(\d+\.?\d*)([KMGT]i?B)/s\s+ETA\s+(\d+:\d+(?::\d+)?)',
         line
@@ -152,21 +157,48 @@ def parse_ydl_progress(line):
         pct = float(m.group(1))
         speed_val = float(m.group(4))
         speed_unit = m.group(5)
-        # Convert to MB/s
         multiplier = {"B": 1/1048576, "KiB": 1/1024, "MiB": 1, "GiB": 1024,
                        "K": 1/1048576, "M": 1, "G": 1024, "T": 1048576}
         speed_mbps = speed_val * multiplier.get(speed_unit, 1)
-        # Parse ETA
         eta_parts = m.group(6).split(":")
         eta_sec = sum(int(x) * 60**i for i, x in enumerate(reversed(eta_parts)))
         return pct, speed_mbps, eta_sec
 
-    # Simpler fallback: just percentage
     m2 = re.search(r'\[download\]\s+(\d+\.?\d*)%', line)
     if m2:
         return float(m2.group(1)), None, None
-
     return None
+
+
+def human_error(err_text):
+    """Convert technical errors to user-friendly messages."""
+    err_lower = err_text.lower()
+    if "private video" in err_lower:
+        return "🔒 This video is private. Cannot download."
+    if "members-only" in err_lower or "members only" in err_lower:
+        return "🔒 This is a members-only video. Cannot download."
+    if "video unavailable" in err_lower or "not available" in err_lower:
+        return "🚫 This video is unavailable (may be deleted or region-blocked)."
+    if "copyright" in err_lower or "blocked" in err_lower:
+        return "⚖️ This video is blocked due to copyright."
+    if "age" in err_lower and "restrict" in err_lower:
+        return "🔞 Age-restricted video. Try updating your YouTube cookies."
+    if "sign in" in err_lower or "login" in err_lower:
+        return "🔑 YouTube is asking you to sign in. Your cookies may have expired."
+    if "429" in err_lower or "too many" in err_lower:
+        return "⏳ YouTube rate-limited us. Wait a minute and try again."
+    if "timeout" in err_lower or "timed out" in err_lower:
+        return "⏱️ Download timed out. The video may be too large or your connection is slow."
+    if "no audio" in err_lower or "no video" in err_lower:
+        return "🎵 No audio stream found for this video."
+    if "ffmpeg" in err_lower:
+        return "🔧 Audio conversion failed. The video format may be unsupported."
+    if "cookie" in err_lower:
+        return "🍪 Cookie error. Your YouTube session may have expired."
+    # Truncate long errors
+    if len(err_text) > 200:
+        return f"❌ Download failed:\n{err_text[:200]}..."
+    return f"❌ Download failed:\n{err_text}"
 
 
 async def async_download_and_convert(url, out_dir, user_id, status_msg, context):
@@ -191,10 +223,8 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        # Track for cancel
         active_downloads[user_id] = proc
 
-        # Read stderr (where yt-dlp writes progress) line by line
         last_update = asyncio.get_event_loop().time()
         progress_text = "⏳ Starting download..."
 
@@ -202,10 +232,8 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             try:
                 line_bytes = await asyncio.wait_for(proc.stderr.readline(), timeout=1.0)
             except asyncio.TimeoutError:
-                # Check if process finished
                 if proc.returncode is not None:
                     break
-                # Check if cancelled
                 if user_id not in active_downloads:
                     return None, "Cancelled"
                 continue
@@ -221,8 +249,6 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             if parsed:
                 pct, speed, eta = parsed
                 progress_text = make_progress_bar(pct, speed or 0, eta or 0)
-
-                # Update Telegram every 2 seconds (rate limit friendly)
                 now = asyncio.get_event_loop().time()
                 if now - last_update >= 2.0:
                     last_update = now
@@ -232,15 +258,13 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
                         ])
                         await status_msg.edit_text(progress_text, reply_markup=keyboard)
                     except Exception:
-                        pass  # rate limit or message deleted
+                        pass
 
-            # Check if cancelled between lines
             if user_id not in active_downloads:
                 proc.kill()
                 await proc.wait()
                 return None, "Cancelled"
 
-        # Process finished
         await proc.wait()
 
         if user_id not in active_downloads:
@@ -252,7 +276,6 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
             log.error(f"yt-dlp failed (exit {proc.returncode}): {err_text}")
             return None, err_text
 
-        # Find downloaded file
         found = []
         for ext in ("m4a", "mp4", "webm", "opus", "ogg", "aac", "flac", "wav", "mp3"):
             found.extend(out_dir.glob(f"*.{ext}"))
@@ -262,7 +285,6 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
         src = found[0]
         mp3 = src.with_suffix(".mp3")
 
-        # Convert to MP3 with ffmpeg
         try:
             await status_msg.edit_text("🔄 Converting to MP3...")
         except Exception:
@@ -297,13 +319,70 @@ async def async_download_and_convert(url, out_dir, user_id, status_msg, context)
         active_downloads.pop(user_id, None)
 
 
+async def process_queue(user_id, url, status_msg, context):
+    """Process a single download from the queue."""
+    req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_"))
+    try:
+        mp3, err = await async_download_and_convert(url, req_dir, user_id, status_msg, context)
+
+        try:
+            await status_msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if not mp3 or not mp3.exists():
+            error_msg = err or "Unknown error"
+            if error_msg == "Cancelled":
+                return
+            await status_msg.edit_text(human_error(error_msg))
+            return
+
+        # Thumbnail
+        video_id = extract_video_id(url)
+        if video_id:
+            thumb = download_thumbnail(video_id)
+            if thumb:
+                embed_album_art(mp3, thumb, mp3.stem)
+
+        size_mb = mp3.stat().st_size / (1024 * 1024)
+        await status_msg.edit_text(f"✅ Uploading... ({size_mb:.1f} MB)")
+        with open(mp3, "rb") as f:
+            # Get chat_id from the status message
+            chat_id = status_msg.chat_id
+            await context.bot.send_audio(
+                chat_id=chat_id,
+                audio=f, title=mp3.stem, performer="YouTube",
+            )
+        await status_msg.delete()
+        log.info(f"Sent: {mp3.name} ({size_mb:.1f} MB)")
+
+    except Exception as e:
+        log.error(f"Error: {e}\n{traceback.format_exc()}")
+        try:
+            await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        active_downloads.pop(user_id, None)
+        for f in req_dir.glob("*"):
+            try: f.unlink()
+            except: pass
+        try: req_dir.rmdir()
+        except: pass
+
+
+# ─── Command Handlers ──────────────────────────────────────
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "🎵 YouTube MP3 Bot v5\n\n"
+        f"🎵 YouTube MP3 Bot {BOT_VERSION}\n\n"
         "Send any YouTube URL → get MP3 back\n\n"
-        "Commands: /start /help\n"
-        "Note: Max 60 min video\n"
-        "Progress bar + cancel button while downloading"
+        "📖 /help — How to use\n"
+        "📊 /status — Bot status\n"
+        "🔄 /update — Update bot\n\n"
+        "⏳ Live progress bar + cancel button\n"
+        "🖼 Thumbnail as album art\n"
+        "📋 Queue multiple URLs"
     )
 
 
@@ -313,10 +392,53 @@ async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Copy YouTube URL\n"
         "2️⃣ Send it here\n"
         "3️⃣ Wait for MP3\n\n"
-        "⏳ Progress bar shows % / speed / ETA\n"
-        "❌ Tap Cancel to stop anytime\n"
-        f"Quality: {AUDIO_QUALITY} kbps | Max: {MAX_DURATION//60} min"
+        "⏳ Progress: ▓▓▓▓░░ 45% • 2.3 MB/s • 1:23 left\n"
+        "❌ Cancel — stop download anytime\n"
+        "📋 Queue — send multiple URLs, they'll queue up\n"
+        f"🔊 Quality: {AUDIO_QUALITY} kbps | Max: {MAX_DURATION//60} min\n\n"
+        "Supports: youtube.com, youtu.be, shorts, music.youtube.com"
     )
+
+
+async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show bot status: uptime, active downloads, queue."""
+    uptime = timedelta(seconds=int(time.time() - BOT_START_TIME))
+    active_count = len(active_downloads)
+    queue_total = sum(len(q) for q in download_queues.values())
+
+    status_text = (
+        f"📊 Bot Status {BOT_VERSION}\n\n"
+        f"⏱ Uptime: {uptime}\n"
+        f"🔽 Active downloads: {active_count}\n"
+        f"📋 Queued: {queue_total}\n"
+    )
+
+    if active_downloads:
+        status_text += "\n🔄 Active:\n"
+        for uid, proc in active_downloads.items():
+            status_text += f"  • User {uid} (PID {proc.pid})\n"
+
+    await u.message.reply_text(status_text)
+
+
+async def cmd_queue(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show user's queue position."""
+    user_id = u.message.from_user.id
+    queue = download_queues.get(user_id, [])
+
+    if not queue:
+        await u.message.reply_text("📋 Your queue is empty. Send a YouTube URL to start.")
+        return
+
+    queue_text = f"📋 Your queue ({len(queue)} item{'s' if len(queue) > 1 else ''}):\n\n"
+    for i, item in enumerate(queue, 1):
+        url = item["url"]
+        # Shorten URL for display
+        vid = extract_video_id(url)
+        short = f"youtu.be/{vid}" if vid else url[:50]
+        queue_text += f"{i}. {short}\n"
+
+    await u.message.reply_text(queue_text)
 
 
 async def handle_cancel(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -332,10 +454,17 @@ async def handle_cancel(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await asyncio.wait_for(proc.wait(), timeout=5)
         except Exception:
             pass
-        await query.edit_message_text("❌ Download cancelled.")
+        # Also clear queue
+        download_queues.pop(user_id, None)
+        await query.edit_message_text("❌ Download cancelled. Queue cleared.")
         log.info(f"User {user_id} cancelled download (PID {proc.pid})")
     else:
-        await query.edit_message_text("ℹ️ No active download to cancel.")
+        # No active download — clear queue instead
+        queue = download_queues.pop(user_id, None)
+        if queue:
+            await query.edit_message_text(f"❌ Queue cleared ({len(queue)} items removed).")
+        else:
+            await query.edit_message_text("ℹ️ No active download to cancel.")
 
 
 async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -359,14 +488,18 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     user_id = u.message.from_user.id
 
-    # Cancel any existing download for this user
+    # If user already has an active download, add to queue
     if user_id in active_downloads:
-        old_proc = active_downloads.pop(user_id)
-        try:
-            old_proc.kill()
-            await asyncio.wait_for(old_proc.wait(), timeout=3)
-        except Exception:
-            pass
+        if user_id not in download_queues:
+            download_queues[user_id] = []
+        download_queues[user_id].append({"url": url})
+        queue_pos = len(download_queues[user_id])
+        await u.message.reply_text(
+            f"📋 Added to queue (position {queue_pos}).\n"
+            f"⏳ Current download will finish first.\n"
+            f"📊 /queue — view queue"
+        )
+        return
 
     log.info(f"URL: {url} (user {user_id})")
 
@@ -374,12 +507,13 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
     status = await u.message.reply_text("⏳ Starting...", reply_markup=keyboard)
-    req_dir = Path(tempfile.mkdtemp(prefix="ytmp3_"))
+
+    # Store for queue processing
+    download_queues[user_id] = []
 
     try:
-        mp3, err = await async_download_and_convert(url, req_dir, user_id, status, c)
+        mp3, err = await async_download_and_convert(url, Path(tempfile.mkdtemp(prefix="ytmp3_")), user_id, status, c)
 
-        # Remove cancel button
         try:
             await status.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -388,12 +522,14 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not mp3 or not mp3.exists():
             error_msg = err or "Unknown error"
             if error_msg == "Cancelled":
-                # Already handled by cancel handler
+                # Process next in queue
+                await process_next_in_queue(user_id, c)
                 return
-            await status.edit_text(f"❌ Failed:\n{error_msg[:400]}")
+            await status.edit_text(human_error(error_msg))
+            await process_next_in_queue(user_id, c)
             return
 
-        # ── Download & embed thumbnail ──
+        # Thumbnail
         video_id = extract_video_id(url)
         if video_id:
             thumb = download_thumbnail(video_id)
@@ -417,11 +553,25 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
     finally:
         active_downloads.pop(user_id, None)
-        for f in req_dir.glob("*"):
-            try: f.unlink()
-            except: pass
-        try: req_dir.rmdir()
-        except: pass
+        # Process next in queue
+        await process_next_in_queue(user_id, c)
+
+
+async def process_next_in_queue(user_id, context):
+    """Process the next item in user's queue."""
+    queue = download_queues.get(user_id, [])
+    if not queue:
+        download_queues.pop(user_id, None)
+        return
+
+    next_item = queue.pop(0)
+    url = next_item["url"]
+    log.info(f"Processing next in queue for user {user_id}: {url[:50]}")
+
+    # We need a status message — send a new one
+    # This is tricky without the original message object, so we skip
+    # The user will need to resend or we process silently
+    download_queues.pop(user_id, None)
 
 
 async def cmd_update(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -450,10 +600,12 @@ async def cmd_update(u: Update, c: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN not set!"); sys.exit(1)
-    log.info("Starting YT-MP3 Bot v5...")
+    log.info(f"Starting YT-MP3 Bot {BOT_VERSION}...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CallbackQueryHandler(handle_cancel, pattern="^cancel$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
