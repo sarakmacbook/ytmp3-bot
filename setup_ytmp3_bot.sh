@@ -79,10 +79,18 @@ curl -sL "$GH_RAW/ytmp3_bot.py" -o "$BOT_SCRIPT"
 chmod +x "$BOT_SCRIPT"
 info "Bot script downloaded: $BOT_SCRIPT"
 
+# ─── Step 5b: Cookies check ─────────────────────────────────
+if [ -f "$BOT_DIR/cookies.txt" ]; then
+    info "Cookies file found — bot will use authentication"
+else
+    warn "No cookies.txt found — downloads may fail on flagged IPs"
+    warn "Export cookies from your browser and place at $BOT_DIR/cookies.txt"
+fi
+
 # ─── Step 6: Systemd service ───────────────────────────────
 info "Creating systemd service..."
 
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" << SRVEOF
 [Unit]
 Description=YouTube MP3 Telegram Bot
 After=network-online.target
@@ -91,7 +99,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${BOT_DIR}
-Environment=BOT_TOKEN=${BOT_...thon ${BOT_SCRIPT}
+Environment=COOKIE_FILE=${BOT_DIR}/cookies.txt
+ExecStart=${BOT_DIR}/venv/bin/python ${BOT_SCRIPT}
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -99,7 +108,7 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SRVEOF
 
 # ─── Step 7: Start ─────────────────────────────────────────
 info "Starting bot service..."
