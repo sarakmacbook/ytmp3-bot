@@ -10,6 +10,7 @@ BOT_DIR="/opt/ytmp3-bot"
 SERVICE_NAME="ytmp3-bot"
 PYTHON="/usr/bin/python3"
 BOT_SCRIPT="$BOT_DIR/bot.py"
+GH_RAW="https://raw.githubusercontent.com/sarakmacbook/ytmp3-bot/main"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,10 +73,11 @@ curl -sL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
   -o "$BOT_DIR/venv/bin/yt-dlp"
 chmod +x "$BOT_DIR/venv/bin/yt-dlp"
 
-# ─── Step 5: Bot script ────────────────────────────────────
-info "Writing bot script..."
-cp /home/ubuntu/.hermes/scripts/ytmp3_bot.py "$BOT_SCRIPT"
+# ─── Step 5: Download bot script from GitHub ────────────────
+info "Downloading bot script from GitHub..."
+curl -sL "$GH_RAW/ytmp3_bot.py" -o "$BOT_SCRIPT"
 chmod +x "$BOT_SCRIPT"
+info "Bot script downloaded: $BOT_SCRIPT"
 
 # ─── Step 6: Systemd service ───────────────────────────────
 info "Creating systemd service..."
@@ -89,8 +91,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${BOT_DIR}
-Environment=BOT_TOKEN=${BOT_TOKEN}
-ExecStart=${BOT_DIR}/venv/bin/python ${BOT_SCRIPT}
+Environment=BOT_TOKEN=${BOT_...thon ${BOT_SCRIPT}
 Restart=always
 RestartSec=10
 StandardOutput=journal
