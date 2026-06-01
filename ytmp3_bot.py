@@ -436,10 +436,11 @@ async def process_queue(user_id, url, status_msg, context):
                 from telegram import InputFile
                 thumb_io = io.BytesIO(thumb_bytes)
                 thumb_io.name = "cover.jpg"
+                thumb_io.seek(0)
                 await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=InputFile(thumb_io, filename="cover.jpg"),
-                    caption=f"🎵 {mp3.stem}\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
+                    caption=f"🎵 {mp3.stem}\\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
                 )
             except Exception as e:
                 log.warning(f"Could not send thumbnail photo: {e}")
@@ -662,9 +663,10 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 from telegram import InputFile
                 thumb_io = io.BytesIO(thumb_bytes)
                 thumb_io.name = "cover.jpg"
+                thumb_io.seek(0)
                 await u.message.reply_photo(
                     photo=InputFile(thumb_io, filename="cover.jpg"),
-                    caption=f"🎵 {mp3.stem}\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
+                    caption=f"🎵 {mp3.stem}\\n📥 {size_mb:.1f} MB • {AUDIO_QUALITY} kbps",
                 )
             except Exception as e:
                 log.warning(f"Could not send thumbnail photo: {e}")
